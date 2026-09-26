@@ -1,0 +1,8 @@
+external/
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Markdown: only README files are tracked. PRD, specs and plans stay local.
+*.md
+!README.md
