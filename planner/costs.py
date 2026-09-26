@@ -1,0 +1,100 @@
+"""Residuals and their Jacobians, plus the toy problem that exercises the solver."""
+from __future__ import annotations
+
+from typing import Sequence, Tuple
+
+import numpy as np
+
+from planner import bicycle
+
+
+def hinge(z: np.ndarray) -> np.ndarray:
+    return np.maximum(z, 0.0)
+
+
+def wrap_angle(a: np.ndarray) -> np.ndarray:
+    return np.arctan2(np.sin(a), np.cos(a))
+
+
+class TrackingProblem:
+    """Track a time-indexed reference (x, y, psi, v)_k with the bicycle. P3 replaces the tracking residuals.
+
+    Per-knot residuals (p = 11): tracking x, y, psi, v | effort jerk, steer_rate |
+    limits a_hi, a_lo, delta_hi, delta_lo, v_neg. Terminal (pN = 9): tracking + limits.
+    """
+
+    n, m = bicycle.NX, bicycle.NU
+    N_TRACK, N_EFFORT, N_LIMIT = 4, 2, 5  # row counts; rows are laid out in this order
+    p, pN = N_TRACK + N_EFFORT + N_LIMIT, N_TRACK + N_LIMIT
+
+    def __init__(
+        self,
+        ref: np.ndarray,  # (N+1, 4)
+        *,
+        w_pos: float = 1.0,
+        w_psi: float = 1.0,
+        w_v: float = 1.0,
+        w_jerk: float = 0.1,
+        w_steer_rate: float = 0.1,
+        w_limit: float = 100.0,
+        a_min: float = -4.05,
+        a_max: float = 2.40,
+        delta_max: float = np.pi / 3,
+        u_lb: Sequence[float] = (-4.0, -0.5),
+        u_ub: Sequence[float] = (4.0, 0.5),
+    ) -> None:
+        self.ref = np.array(ref, dtype=np.float64)  # copy: callers reuse reference buffers between ticks
+        self.N = self.ref.shape[0] - 1
+        self.s_track = np.sqrt(np.array([w_pos, w_pos, w_psi, w_v]))
+        self.s_effort = np.sqrt(np.array([w_jerk, w_steer_rate]))
+        self.s_limit = float(np.sqrt(w_limit))
+        self.a_min, self.a_max, self.delta_max = a_min, a_max, delta_max
+        self.u_lb = np.array(u_lb, dtype=np.float64)
+        self.u_ub = np.array(u_ub, dtype=np.float64)
+
+    step = staticmethod(bicycle.step)
+    linearize = staticmethod(bicycle.linearize)
+
+    def _limit_args(self, X: np.ndarray) -> np.ndarray:
+        """(K, 6) -> (K, 5) hinge arguments z; the limit is violated where z > 0."""
+        v, a, delta = X[:, 3], X[:, 4], X[:, 5]
+        return np.stack([a - self.a_max, self.a_min - a, delta - self.delta_max, -self.delta_max - delta, -v], axis=1)
+
+    def _state_residuals(self, X: np.ndarray) -> np.ndarray:
+        """(K, 6) with the matching rows of self.ref -> (K, pN): tracking then limits."""
+        e = X[:, : self.N_TRACK] - self.ref[: X.shape[0]]
+        e[:, 2] = wrap_angle(e[:, 2])
+        return np.concatenate([self.s_track * e, self.s_limit * hinge(self._limit_args(X))], axis=1)
+
+    def _state_jacobians(self, X: np.ndarray) -> np.ndarray:
+        """(K, 6) -> (K, pN, 6). Rows and signs mirror _limit_args; columns are the states v=3, a=4, delta=5."""
+        J = np.zeros((X.shape[0], self.pN, self.n))
+        i = np.arange(self.N_TRACK)
+        J[:, i, i] = self.s_track  # tracked states are the first N_TRACK states, in order
+        active = self.s_limit * (self._limit_args(X) > 0.0)
+        t = self.N_TRACK
+        J[:, t + 0, 4] = active[:, 0]
+        J[:, t + 1, 4] = -active[:, 1]
+        J[:, t + 2, 5] = active[:, 2]
+        J[:, t + 3, 5] = -active[:, 3]
+        J[:, t + 4, 3] = -active[:, 4]
+        return J
+
+    def residuals(self, X: np.ndarray, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """X (N+1, 6), U (N, 2) -> r (N, p), rN (pN,)."""
+        s = self._state_residuals(X)  # (N+1, pN)
+        t = self.N_TRACK
+        r = np.concatenate([s[:-1, :t], self.s_effort * U, s[:-1, t:]], axis=1)
+        return r, s[-1]
+
+    def residual_jacobians(self, X: np.ndarray, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """X (N+1, 6), U (N, 2) -> Jx (N, p, 6), Ju (N, p, 2), JxN (pN, 6)."""
+        Js = self._state_jacobians(X)  # (N+1, pN, 6)
+        N, t = self.N, self.N_TRACK
+        Jx = np.zeros((N, self.p, self.n))
+        Jx[:, :t] = Js[:-1, :t]
+        Jx[:, t + self.N_EFFORT :] = Js[:-1, t:]
+        Ju = np.zeros((N, self.p, self.m))
+        Ju[:, t + 0, 0] = self.s_effort[0]
+        Ju[:, t + 1, 1] = self.s_effort[1]
+        return Jx, Ju, Js[-1]
