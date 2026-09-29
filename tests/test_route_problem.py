@@ -1,10 +1,10 @@
-"""C5, C5b: RouteProblem Jacobians vs central differences. C6: residual values by hand. C6b: the solver drives it."""
+"""RouteProblem. C5: Jacobians vs central differences. C5b: exact Jacobians for knots past either end of the
+segment window. C6: residual values by hand. C6b: the solver pulls an offset start onto the centerline."""
 import math
 
 import numpy as np
 import pytest
 
-from planner import bicycle
 from planner.costs import RouteProblem
 from planner.ilqr import solve
 from planner.route import make_centerline, project
@@ -45,7 +45,7 @@ def _smooth_states(problem, rng, K):
 
 
 @pytest.mark.parametrize("westbound", [False, True])
-def test_c5_jacobians_match_central_differences(westbound):
+def test_jacobians_match_central_differences(westbound):
     cl = _s_curve(westbound=westbound)
     # Tight limits so every hinge fires somewhere in the sample (defaults almost never trip lat, yaw, delta).
     problem = RouteProblem(cl, (0, len(cl.s) - 1), N=100, a_min=-1.0, a_max=1.0, delta_max=0.3,
@@ -55,27 +55,24 @@ def test_c5_jacobians_match_central_differences(westbound):
     active = problem._limit_args(X) > 0.0
     assert np.all(active.any(axis=0)), "every hinge must be active on at least one compared knot"
     Jx, Ju, JxN = problem.residual_jacobians(X, U)
-    for k in range(problem.N + 1):
-        for i in range(bicycle.NX):
-            Xp, Xm = X.copy(), X.copy()
-            Xp[k, i] += EPS
-            Xm[k, i] -= EPS
-            (rp, rNp), (rm, rNm) = problem.residuals(Xp, U), problem.residuals(Xm, U)
-            if k < problem.N:
-                fd, an = (rp[k] - rm[k]) / (2 * EPS), Jx[k, :, i]
-            else:
-                fd, an = (rNp - rNm) / (2 * EPS), JxN[:, i]
-            assert np.allclose(an, fd, rtol=1e-6, atol=1e-6), f"knot {k}, state {i}"
-    for k in range(problem.N):
-        for i in range(bicycle.NU):
-            Up, Um = U.copy(), U.copy()
-            Up[k, i] += EPS
-            Um[k, i] -= EPS
-            fd = (problem.residuals(X, Up)[0][k] - problem.residuals(X, Um)[0][k]) / (2 * EPS)
-            assert np.allclose(Ju[k, :, i], fd, rtol=1e-6, atol=1e-6), f"knot {k}, control {i}"
+    # Residuals at knot k depend only on (x_k, u_k), since each knot projects on its own onto a fixed window, so
+    # perturbing one component at every knot at once gives that Jacobian column for all knots in one evaluation pair.
+    for i in range(problem.n):
+        d = np.zeros_like(X)
+        d[:, i] = EPS
+        rp, rNp = problem.residuals(X + d, U)
+        rm, rNm = problem.residuals(X - d, U)
+        assert np.allclose(Jx[:, :, i], (rp - rm) / (2 * EPS), rtol=1e-6, atol=1e-7), f"Jx: state {i}"
+        assert np.allclose(JxN[:, i], (rNp - rNm) / (2 * EPS), rtol=1e-6, atol=1e-7), f"JxN: state {i}"
+    for i in range(problem.m):
+        d = np.zeros_like(U)
+        d[:, i] = EPS
+        rp, _ = problem.residuals(X, U + d)
+        rm, _ = problem.residuals(X, U - d)
+        assert np.allclose(Ju[:, :, i], (rp - rm) / (2 * EPS), rtol=1e-6, atol=1e-7), f"Ju: control {i}"
 
 
-def test_c6_residuals_by_hand():
+def test_residuals_by_hand():
     cl = _straight()  # v_ref = 10 until the braking zone for the route end, which starts at 100 - 100/3 m
     problem = RouteProblem(cl, (0, len(cl.s) - 1), N=1)
     assert (problem.p, problem.pN) == (14, 12)
@@ -109,7 +106,7 @@ def test_c6_residuals_by_hand():
     assert rw[0, 1] == pytest.approx(0.05, abs=1e-12)
 
 
-def test_c6b_solver_pulls_an_offset_start_onto_the_centerline():
+def test_solver_pulls_an_offset_start_onto_the_centerline():
     cl = _s_curve()
     problem = RouteProblem(cl, cl.segment_window(0.0, 80.0))
     x0 = np.array([0.0, 1.0, 0.0, 8.0, 0.0, 0.0])  # 1 m left of the centerline at its start
@@ -124,7 +121,7 @@ def test_c6b_solver_pulls_an_offset_start_onto_the_centerline():
     assert np.max(problem._limit_args(sol.X)) < 0.02
 
 
-def test_c5b_knots_past_the_window_end_have_exact_jacobians():
+def test_knots_past_the_window_end_have_exact_jacobians():
     """Past the last segment the fraction clips to 1, so e_psi and e_v stop depending on position. The horizon runs
     past the window near the route end, where v_ref drops to 0, so a Jacobian that ignored the clip would be wrong."""
     cl = _straight()
@@ -133,7 +130,7 @@ def test_c5b_knots_past_the_window_end_have_exact_jacobians():
     _check_xy_jacobians(problem, X)
 
 
-def test_c5b_knots_before_the_window_start_have_exact_jacobians():
+def test_knots_before_the_window_start_have_exact_jacobians():
     """The same clip at the other end: the window starts inside the braking zone (v_ref falls from 67 m on), and the
     knots sit 2-3 m before it."""
     cl = _straight()

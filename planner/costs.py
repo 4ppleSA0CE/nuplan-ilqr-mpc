@@ -1,4 +1,4 @@
-"""Residuals and their Jacobians, plus the toy problem that exercises the solver."""
+"""Residuals and their Jacobians: the toy TrackingProblem that exercises the solver, and RouteProblem."""
 from __future__ import annotations
 
 from typing import Sequence, Tuple
@@ -6,7 +6,7 @@ from typing import Sequence, Tuple
 import numpy as np
 
 from planner import bicycle
-from planner.route import project
+from planner.route import Centerline, project
 
 
 def hinge(z: np.ndarray) -> np.ndarray:
@@ -18,7 +18,7 @@ def wrap_angle(a: np.ndarray) -> np.ndarray:
 
 
 class TrackingProblem:
-    """Track a time-indexed reference (x, y, psi, v)_k with the bicycle. P3 replaces the tracking residuals.
+    """Track a time-indexed reference (x, y, psi, v)_k with the bicycle.
 
     Per-knot residuals (p = 11): tracking x, y, psi, v | effort jerk, steer_rate |
     limits a_hi, a_lo, delta_hi, delta_lo, v_neg. Terminal (pN = 9): tracking + limits.
@@ -115,7 +115,7 @@ class RouteProblem:
 
     def __init__(
         self,
-        centerline,  # route.Centerline
+        centerline: Centerline,
         seg_window: Tuple[int, int],
         N: int = 40,
         *,
@@ -145,7 +145,7 @@ class RouteProblem:
     step = staticmethod(bicycle.step)
     linearize = staticmethod(bicycle.linearize)
 
-    def _tracking(self, X: np.ndarray):
+    def _tracking(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """(K, 6) -> e (K, 3) = (e_y, e_psi, e_v) and its Jacobian w.r.t. (x, y), (K, 3, 2)."""
         cl = self.cl
         seg, f = project(cl, self.lo, self.hi, X[:, :2], X[:, 2])

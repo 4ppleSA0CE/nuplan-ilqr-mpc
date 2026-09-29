@@ -1,4 +1,6 @@
-"""C1-C4, C3b: centerline resampling, projection, speed reference, loop-back guards. No nuPlan."""
+"""Route centerline, no nuPlan. C1: resampling, lane joins, short routes. C2: projection on an arc.
+C3: speed reference and limit changes. C3b: a route starting mid-curve. C4: heading gate, its fallback, and the
+segment window against a later pass. Plus segment_window bounds."""
 import numpy as np
 import pytest
 
@@ -47,7 +49,7 @@ TRANSFORMS = {
 }
 
 
-def test_c1_resample_spacing_length_and_duplicates():
+def test_resample_spacing_length_and_duplicates():
     rng = np.random.default_rng(1)
     line, x = _irregular(37.3, rng), _irregular(80.0, rng)
     cases = {
@@ -57,7 +59,7 @@ def test_c1_resample_spacing_length_and_duplicates():
     }
     for name, pts in cases.items():
         pts = np.insert(pts, 3, pts[3], axis=0)  # a duplicate point, as where two lanes join
-        s, xy = resample(pts)
+        s, xy, _ = resample(pts)
         gaps = np.diff(s)
         assert np.allclose(gaps[:-1], route.DS, atol=1e-9), name
         assert route.DS / 2 < gaps[-1] <= 1.5 * route.DS + 1e-9, name
@@ -66,24 +68,24 @@ def test_c1_resample_spacing_length_and_duplicates():
         assert np.allclose(xy[0], pts[0]) and np.allclose(xy[-1], pts[-1]), name
 
 
-def test_c1_lane_join_that_steps_backward_is_dropped():
+def test_lane_join_that_steps_backward_is_dropped():
     lane_a = np.column_stack([np.arange(0.0, 50.01, 1.0), np.zeros(51)])
     lane_b = np.column_stack([np.arange(49.7, 150.0, 1.0), np.zeros(101)])  # starts 0.3 m behind lane a's end
     pts = np.vstack([lane_a, lane_b])
     cl = make_centerline(pts, np.full(len(pts), 10.0), a_lat_ref=A_LAT, b_ref=B_REF)
     assert np.allclose(cl.psi, 0.0)
     assert np.all(cl.kappa < 1e-9)
-    assert np.min(cl.v_ref[cl.s < 100.0]) == 10.0  # no dip at the join (braking for the route end starts at 117 m)
+    assert np.min(cl.v_ref[cl.s < 100.0]) == 10.0  # no dip at the join (braking for the route end starts near 116 m)
 
 
-def test_c1_too_short_route_is_rejected():
+def test_too_short_route_is_rejected():
     with pytest.raises(ValueError):
         make_centerline(np.array([[0.0, 0.0], [0.6, 0.0]]), np.full(2, 10.0), a_lat_ref=A_LAT, b_ref=B_REF)
     with pytest.raises(ValueError):
         make_centerline(np.zeros((4, 2)), np.full(4, 10.0), a_lat_ref=A_LAT, b_ref=B_REF)
 
 
-def test_c2_projection_on_an_arc():
+def test_projection_on_an_arc():
     radius = 40.0
     # Fine input spacing: the input polyline's own sagitta would otherwise dominate (1.1 m chords: 3.8e-3 m).
     # 100 m of arc turns 2.5 rad from heading pi/2, so the heading crosses +-pi at th = pi/2.
@@ -104,7 +106,7 @@ def test_c2_projection_on_an_arc():
 
 
 @pytest.mark.parametrize("name", TRANSFORMS)
-def test_c3_speed_reference(name):
+def test_speed_reference(name):
     radius, v_lim = 15.0, 15.0  # braking 15 -> 6.7 m/s at 1.5 m/s^2 takes 60 m, so the straight is 100 m
     pts = TRANSFORMS[name](_straight_arc_straight(radius=radius))
     cl = make_centerline(pts, np.full(len(pts), v_lim), a_lat_ref=A_LAT, b_ref=B_REF)
@@ -120,7 +122,7 @@ def test_c3_speed_reference(name):
     assert v[np.argmin(np.abs(cl.s - 5.0))] == v_lim  # far enough before the curve to be at the limit
 
 
-def test_c3_speed_limit_changes_where_the_next_lane_starts():
+def test_speed_limit_changes_where_the_next_lane_starts():
     x = np.arange(0.0, 200.01, 1.0)
     limit = np.where(x < 50.0, 15.0, 8.0)  # the lane starting at x = 50 has a lower limit
     cl = make_centerline(np.column_stack([x, 0 * x]), limit, a_lat_ref=A_LAT, b_ref=B_REF)
@@ -128,7 +130,7 @@ def test_c3_speed_limit_changes_where_the_next_lane_starts():
     assert np.all(cl.v_ref <= cl.v_limit)
 
 
-def test_c3b_route_starting_in_a_curve_is_slowed_from_the_first_sample():
+def test_route_starting_in_a_curve_is_slowed_from_the_first_sample():
     radius = 15.0  # starts mid-curve: curvature must not be lost at the route ends
     arc = _arc(radius, np.arange(0.0, 30.0, 0.2))
     heading = np.array([-np.sin(30.0 / radius), np.cos(30.0 / radius)])
@@ -172,7 +174,7 @@ def _plain_nearest(cl, lo, hi, p):
         ((10.0, 1.2), -np.pi + 0.01, 3.0),  # the same heading written just above -pi
     ],
 )
-def test_c4_heading_gate_picks_the_branch_going_our_way(p, psi, branch_y):
+def test_heading_gate_picks_the_branch_going_our_way(p, psi, branch_y):
     pts = _hairpin()
     cl = make_centerline(pts, np.full(len(pts), 10.0), a_lat_ref=A_LAT, b_ref=B_REF)
     whole = (0, len(cl.s) - 1)
@@ -181,7 +183,7 @@ def test_c4_heading_gate_picks_the_branch_going_our_way(p, psi, branch_y):
     assert cl.xy[_plain_nearest(cl, *whole, np.array(p)), 1] != pytest.approx(branch_y)  # the case needs the gate
 
 
-def test_c4_facing_away_from_the_whole_window_falls_back_to_nearest():
+def test_facing_away_from_the_whole_window_falls_back_to_nearest():
     pts = _hairpin()
     cl = make_centerline(pts, np.full(len(pts), 10.0), a_lat_ref=A_LAT, b_ref=B_REF)
     lo, hi = cl.segment_window(0.0, 25.0)  # eastbound segments only
@@ -190,7 +192,7 @@ def test_c4_facing_away_from_the_whole_window_falls_back_to_nearest():
     assert seg[0] == _plain_nearest(cl, lo, hi, p) and 0.0 <= f[0] <= 1.0
 
 
-def test_c4_window_keeps_a_knot_off_a_later_pass():
+def test_window_keeps_a_knot_off_a_later_pass():
     pts = _block_loop()
     cl = make_centerline(pts, np.full(len(pts), 10.0), a_lat_ref=A_LAT, b_ref=B_REF)
     P, psi = np.array([[10.0, 1.2]]), np.array([0.0])  # 1.2 m from the first pass, 0.8 m from the later one

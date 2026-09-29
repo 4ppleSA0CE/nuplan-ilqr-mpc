@@ -1,4 +1,4 @@
-"""Route centerline: resampling, speed reference, projection. Only build_centerline() imports nuPlan."""
+"""Route centerline: resampling, speed reference, projection. No nuPlan import."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -54,21 +54,23 @@ def kept_indices(points: np.ndarray) -> np.ndarray:
     return np.asarray(kept)
 
 
-def resample(points: np.ndarray, ds: float = DS) -> Tuple[np.ndarray, np.ndarray]:
-    """Polyline (K, 2) -> s (M,), xy (M, 2) at arc-length spacing ds along the kept points; last gap in
-    (ds/2, 1.5 ds]."""
-    pts = np.asarray(points, dtype=np.float64)
-    pts = pts[kept_indices(pts)]
+def resample(points: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Polyline (K, 2) -> s (M,), xy (M, 2) at arc-length spacing DS along the kept points, last gap in
+    (DS/2, 1.5 DS]; and src (M,) int, the index into points of the last kept point at or before each sample."""
+    points = np.asarray(points, dtype=np.float64)
+    k = kept_indices(points)
+    pts = points[k]
     s_in = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
     length = s_in[-1]
     if length < MIN_ROUTE_M:
         raise ValueError(f"route is {length:.3f} m long; at least {MIN_ROUTE_M} m is needed")
-    s = np.arange(0.0, length, ds)
-    if length - s[-1] < ds / 2:
+    s = np.arange(0.0, length, DS)
+    if length - s[-1] < DS / 2:
         s = s[:-1]
     s = np.append(s, length)
     xy = np.column_stack([np.interp(s, s_in, pts[:, 0]), np.interp(s, s_in, pts[:, 1])])
-    return s, xy
+    src = k[np.clip(np.searchsorted(s_in, s, side="right") - 1, 0, len(k) - 1)]
+    return s, xy, src
 
 
 def headings(xy: np.ndarray) -> np.ndarray:
@@ -78,20 +80,20 @@ def headings(xy: np.ndarray) -> np.ndarray:
     return np.concatenate([[theta[0]], 0.5 * (theta[:-1] + theta[1:]), [theta[-1]]])
 
 
-def curvature(xy: np.ndarray, window_m: float = KAPPA_WINDOW_M) -> np.ndarray:
+def curvature(xy: np.ndarray) -> np.ndarray:
     """(M, 2) -> (M,) unsigned curvature for the speed reference.
 
     Raw: turning angle between adjacent segments over their mean length, copied to the two end samples. Then a
-    centered moving average over window_m, so a kink at a lane join is spread out instead of braking the car to
-    walking pace. The average halves the curvature over the first and last half-window of a curve, so a centered
-    moving maximum over twice that width follows it, and the curve speed holds on the whole arc.
+    centered moving average over KAPPA_WINDOW_M, so a kink at a lane join is spread out instead of braking the car
+    to walking pace. The average cuts the curvature by up to half over the first and last half-window of a curve,
+    so a centered moving maximum over twice that width follows it, and the curve speed holds on the whole arc.
     """
     d = np.diff(xy, axis=0)
     h = np.linalg.norm(d, axis=1)
     theta = np.unwrap(np.arctan2(d[:, 1], d[:, 0]))
     inner = np.diff(theta) / (0.5 * (h[:-1] + h[1:]))
     kappa = np.abs(np.concatenate([inner[:1], inner, inner[-1:]]))
-    n = max(1, int(round(window_m / np.median(h)))) | 1  # odd width keeps both filters centered
+    n = max(1, int(round(KAPPA_WINDOW_M / np.median(h)))) | 1  # odd width keeps both filters centered
     avg = np.convolve(np.pad(kappa, n // 2, mode="edge"), np.ones(n) / n, mode="valid")
     w = 2 * n - 1  # twice the average's reach, so every sample of a curve sees an average taken fully inside it
     return sliding_window_view(np.pad(avg, w // 2, mode="edge"), w).max(axis=1)
@@ -101,24 +103,18 @@ def speed_reference(
     s: np.ndarray, kappa: np.ndarray, v_limit: np.ndarray, a_lat_ref: float, b_ref: float
 ) -> np.ndarray:
     """min(limit, curve speed), braking at b_ref into curves and to 0 at the route end."""
-    v = np.minimum(v_limit, np.sqrt(a_lat_ref / np.maximum(np.abs(kappa), 1e-6)))
+    v = np.minimum(v_limit, np.sqrt(a_lat_ref / np.maximum(kappa, 1e-6)))
     v[-1] = 0.0
     for i in range(len(s) - 2, -1, -1):
         v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2.0 * b_ref * (s[i + 1] - s[i])))
     return v
 
 
-def make_centerline(
-    points: np.ndarray, v_limit_pts: np.ndarray, *, a_lat_ref: float, b_ref: float, ds: float = DS
-) -> Centerline:
+def make_centerline(points: np.ndarray, v_limit_pts: np.ndarray, *, a_lat_ref: float, b_ref: float) -> Centerline:
     """Polyline (K, 2) with a speed limit per input point (K,) -> Centerline. Each sample takes the limit of the
     last kept input point at or before it, so a limit changes where the lane that carries it starts."""
-    points = np.asarray(points, dtype=np.float64)
-    s, xy = resample(points, ds)
-    k = kept_indices(points)
-    s_kept = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(points[k], axis=0), axis=1))])
-    idx = k[np.clip(np.searchsorted(s_kept, s, side="right") - 1, 0, len(k) - 1)]
-    v_limit = np.asarray(v_limit_pts, dtype=np.float64)[idx]
+    s, xy, src = resample(points)
+    v_limit = np.asarray(v_limit_pts, dtype=np.float64)[src]
     kappa = curvature(xy)
     return Centerline(s, xy, headings(xy), kappa, v_limit, speed_reference(s, kappa, v_limit, a_lat_ref, b_ref))
 
