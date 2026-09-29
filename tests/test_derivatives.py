@@ -4,7 +4,7 @@ import math
 import numpy as np
 
 from planner import bicycle
-from planner.costs import TrackingProblem
+from planner.costs import KAPPA_MAX, SIGMA_MAX, TrackingProblem
 
 EPS = 1e-6
 
@@ -45,7 +45,7 @@ def test_residual_jacobians_match_central_differences():
     N = 100
     X, U = _random_states(rng, N + 1, v_lo=-2.0), rng.uniform(-1, 1, (N, 2))
     ref = X[:, :4] + rng.uniform(-1.0, 1.0, (N + 1, 4))  # heading error stays far from the +-pi wrap
-    problem = TrackingProblem(ref, delta_max=0.3, a_min=-3.0, a_max=1.0)  # tight limits so hinges are active
+    problem = TrackingProblem(ref, kappa_max=0.3, a_min=-3.0, a_max=1.0)  # tight limits so hinges are active
     z = problem._limit_args(X)
     keep = (np.abs(z) > 1e-3).all(axis=1)  # stay off the kink, where the derivative is undefined
     assert (z[keep] > 0).any(axis=0).all(), "every hinge must be active on a compared knot or the test proves nothing"
@@ -72,17 +72,17 @@ def test_residual_jacobians_match_central_differences():
 def test_residual_values_and_shapes_match_spec_table():
     """Guards what finite differences cannot: residual order, sqrt(w) scaling, hinge arguments, terminal row, shapes."""
     ref = np.array([[0.0, 0.0, 0.0, 5.0], [1.0, 2.0, 3.0, 4.0]])
-    problem = TrackingProblem(ref, w_pos=4.0, w_psi=9.0, w_v=16.0, w_jerk=25.0, w_steer_rate=36.0, w_limit=49.0)
+    problem = TrackingProblem(ref, w_pos=4.0, w_psi=9.0, w_v=16.0, w_jerk=25.0, w_sigma=36.0, w_limit=49.0)
     assert (problem.n, problem.m, problem.N, problem.p, problem.pN) == (6, 2, 1, 11, 9)
-    assert np.array_equal(problem.u_lb, [-4.0, -0.5]) and np.array_equal(problem.u_ub, [4.0, 0.5])
+    assert np.array_equal(problem.u_lb, [-4.0, -SIGMA_MAX]) and np.array_equal(problem.u_ub, [4.0, SIGMA_MAX])
 
     X = np.array([[0.5, -1.0, 0.1 + 2 * math.pi, 7.0, 3.0, 1.2], [1.0, 2.0, 3.0, -1.0, -5.0, -1.3]])
     U = np.array([[2.0, -0.5]])
-    d_max = math.pi / 3
-    #            x        y         psi (wrapped)  v        jerk     steer     a_hi             a_lo  delta_hi           delta_lo  v_neg
-    expected_r = [2 * 0.5, 2 * -1.0, 3 * 0.1, 4 * 2.0, 5 * 2.0, 6 * -0.5, 7 * (3.0 - 2.40), 0.0, 7 * (1.2 - d_max), 0.0, 0.0]
-    #             tracking vs the LAST ref row   a_hi  a_lo               delta_hi  delta_lo            v_neg
-    expected_rN = [0.0, 0.0, 0.0, 4 * (-1.0 - 4.0), 0.0, 7 * (-4.05 + 5.0), 0.0, 7 * (-d_max + 1.3), 7 * 1.0]
+    k_max = KAPPA_MAX
+    #            x        y         psi (wrapped)  v        jerk     sigma     a_hi             a_lo  kappa_hi           kappa_lo  v_neg
+    expected_r = [2 * 0.5, 2 * -1.0, 3 * 0.1, 4 * 2.0, 5 * 2.0, 6 * -0.5, 7 * (3.0 - 2.40), 0.0, 7 * (1.2 - k_max), 0.0, 0.0]
+    #             tracking vs the LAST ref row   a_hi  a_lo               kappa_hi  kappa_lo            v_neg
+    expected_rN = [0.0, 0.0, 0.0, 4 * (-1.0 - 4.0), 0.0, 7 * (-4.05 + 5.0), 0.0, 7 * (-k_max + 1.3), 7 * 1.0]
 
     r, rN = problem.residuals(X, U)
     assert r.shape == (1, 11) and rN.shape == (9,)
@@ -95,9 +95,9 @@ def test_residual_values_and_shapes_match_spec_table():
 
 
 def test_euler_gap_to_exact_arc():
-    """T4. Constant speed and steering trace an exact circle in continuous time; Euler lags it."""
+    """T4. Constant speed and curvature trace an exact circle in continuous time; Euler lags it."""
     v, yaw_rate, N = 10.0, 0.3, 40
-    x = np.array([0.0, 0.0, 0.0, v, 0.0, math.atan(yaw_rate * bicycle.WHEEL_BASE / v)])
+    x = np.array([0.0, 0.0, 0.0, v, 0.0, yaw_rate / v])
     for _ in range(N):
         x = bicycle.step(x, np.zeros(2))
     T, R = N * bicycle.DT, v / yaw_rate

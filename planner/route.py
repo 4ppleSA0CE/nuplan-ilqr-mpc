@@ -1,6 +1,7 @@
 """Route centerline: resampling, speed reference, projection. No nuPlan import."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Tuple
 
@@ -119,6 +120,16 @@ def make_centerline(points: np.ndarray, v_limit_pts: np.ndarray, *, a_lat_ref: f
     return Centerline(s, xy, headings(xy), kappa, v_limit, speed_reference(s, kappa, v_limit, a_lat_ref, b_ref))
 
 
+def progress_target(cl: Centerline, s0: float, v0: float, n: int, dt: float, a_up: float) -> float:
+    """Arc length reached after n steps of dt from s0 at speed v0, following v_ref but gaining speed at no more than
+    a_up, so the target never asks for more than a comfortable acceleration can deliver. Capped at the route end."""
+    s, v = s0, v0
+    for _ in range(n):
+        v = min(float(np.interp(s, cl.s, cl.v_ref)), v + a_up * dt)
+        s += max(v, 0.0) * dt
+    return min(s, float(cl.s[-1]))
+
+
 def project(cl: Centerline, lo: int, hi: int, P: np.ndarray, psi: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """Nearest segment in [lo, hi) for each point, among segments pointing within 90 degrees of the point's heading.
 
@@ -132,3 +143,93 @@ def project(cl: Centerline, lo: int, hi: int, P: np.ndarray, psi: np.ndarray) ->
     facing = np.cos(psi)[:, None] * t[None, :, 0] + np.sin(psi)[:, None] * t[None, :, 1] > 0.0  # |wrap| < pi/2
     j = np.where(facing.any(axis=1), np.argmin(np.where(facing, dist2, np.inf), axis=1), np.argmin(dist2, axis=1))
     return lo + j, f[np.arange(len(P)), j]
+
+
+
+EXTEND_M = 300.0  # [m] a broken or early-ending route is extended by following the road to this far ahead of the ego
+JOIN_DEPTH = 6  # lanes searched from the ego's lane to reach the route when the ego is not on it
+
+
+def build_centerline(map_api, route_roadblock_ids, ego_state, *, a_lat_ref: float, b_ref: float, v_default: float):
+    """nuPlan route -> (Centerline, info). nuPlan route lists are noisy: some start several roadblocks behind the ego,
+    some have gaps, and a few never come near the ego at all. So:
+
+    1. Start on the lane (or lane connector) under the ego center whose heading is closest to the ego's.
+    2. If that lane's roadblock is on the route, drop the roadblocks before it. Otherwise search JOIN_DEPTH lanes
+       ahead for one that is, and prepend the lanes that lead there.
+    3. Breadth-first search through the remaining route's lanes to its last roadblock, as IDMPlanner does. If it
+       cannot get there, keep the longest route found.
+    4. If the route was not completed and ends less than EXTEND_M ahead of the ego, follow the road from its last
+       lane, taking the successor that turns least.
+
+    info: on_route, joined, complete, extended (bool), no_limit (lanes without a speed limit), lanes (ids used)."""
+    from nuplan.common.maps.maps_datatypes import SemanticMapLayer  # nuPlan stays out of the module import
+    from nuplan.planning.simulation.planner.utils.breadth_first_search import BreadthFirstSearch
+
+    layers = (SemanticMapLayer.LANE, SemanticMapLayer.LANE_CONNECTOR)
+    point, heading = ego_state.center.point, ego_state.center.heading
+
+    def heading_gap(lane) -> float:
+        return abs(math.remainder(lane.baseline_path.get_nearest_pose_from_position(point).heading - heading, 2 * math.pi))
+
+    under = [o for layer in layers for o in map_api.get_all_map_objects(point, layer)]
+    if under:
+        start = min(under, key=heading_gap)
+    else:
+        near = [o for objs in map_api.get_proximal_map_objects(point, 10.0, list(layers)).values() for o in objs]
+        if not near:
+            raise ValueError("no lane within 10 m of the ego")
+        foot = ego_state.car_footprint.geometry
+        start = min(near, key=lambda o: (heading_gap(o) > math.pi / 2, o.polygon.distance(foot)))
+
+    ids = list(route_roadblock_ids)
+    prefix = _path_to_route(start, set(ids)) if start.get_roadblock_id() not in ids else [start]
+    lanes, complete = [start], False
+    if prefix:
+        j = ids.index(prefix[-1].get_roadblock_id())
+        blocks = [map_api.get_map_object(i, SemanticMapLayer.ROADBLOCK)
+                  or map_api.get_map_object(i, SemanticMapLayer.ROADBLOCK_CONNECTOR) for i in ids[j:]]
+        blocks = [b for b in blocks if b is not None]
+        found, complete = BreadthFirstSearch(prefix[-1], [e.id for b in blocks for e in b.interior_edges]).search(
+            blocks[-1], len(blocks))
+        lanes = prefix[:-1] + found
+
+    def centerline(lanes_):
+        pts = [(p.x, p.y) for lane in lanes_ for p in lane.baseline_path.discrete_path]
+        lim = [lane.speed_limit_mps or v_default for lane in lanes_ for _ in lane.baseline_path.discrete_path]
+        return make_centerline(np.array(pts), np.array(lim), a_lat_ref=a_lat_ref, b_ref=b_ref)
+
+    cl = centerline(lanes)
+    ahead = cl.s[-1] - cl.s[int(np.argmin(np.linalg.norm(cl.xy - np.array([point.x, point.y]), axis=1)))]
+    extended = bool(not complete and ahead < EXTEND_M)
+    if extended:
+        length = ahead
+        while length < EXTEND_M and lanes[-1].outgoing_edges:
+            end = lanes[-1].baseline_path.discrete_path[-1].heading
+            nxt = min(lanes[-1].outgoing_edges,
+                      key=lambda e: abs(math.remainder(e.baseline_path.discrete_path[0].heading - end, 2 * math.pi)))
+            lanes.append(nxt)
+            length += nxt.baseline_path.length
+        cl = centerline(lanes)
+    info = dict(on_route=start.get_roadblock_id() in ids, joined=len(prefix) > 1, complete=bool(complete),
+                extended=extended, no_limit=sum(1 for lane in lanes if not lane.speed_limit_mps),
+                lanes=[lane.id for lane in lanes])
+    return cl, info
+
+
+def _path_to_route(start, route_ids):
+    """Shortest lane path from start (inclusive) to a lane whose roadblock is in route_ids, at most JOIN_DEPTH lanes
+    ahead; [] if there is none."""
+    frontier, seen = [[start]], {start.id}
+    for _ in range(JOIN_DEPTH):
+        nxt = []
+        for path in frontier:
+            for e in path[-1].outgoing_edges:
+                if e.id in seen:
+                    continue
+                if e.get_roadblock_id() in route_ids:
+                    return path + [e]
+                seen.add(e.id)
+                nxt.append(path + [e])
+        frontier = nxt
+    return []

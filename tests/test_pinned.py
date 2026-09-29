@@ -22,7 +22,7 @@ def _cases():
     toy, x0, U0 = toy_case()
     toy_params = dict(
         ref=toy.ref, s_track=toy.s_track, s_effort=toy.s_effort, s_limit=toy.s_limit,
-        a_min=toy.a_min, a_max=toy.a_max, delta_max=toy.delta_max, dt=bicycle.DT, wheel_base=bicycle.WHEEL_BASE,
+        a_min=toy.a_min, a_max=toy.a_max, kappa_max=toy.kappa_max, dt=bicycle.DT, wheel_base=bicycle.WHEEL_BASE,
     )
     yield "toy_active_bounds", toy, x0, U0, 50, toy_params
     yield "toy_max_iters", toy, x0, U0, 3, toy_params

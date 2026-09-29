@@ -109,7 +109,7 @@ def test_toy_problem_converges_with_active_bounds():
 
     assert np.all(sol.U >= problem.u_lb) and np.all(sol.U <= problem.u_ub)
     at_bound = (sol.U == problem.u_lb) | (sol.U == problem.u_ub)
-    assert at_bound.any(), "steer-rate box never active: the test is not exercising box-QP"
+    assert at_bound.any(), "sigma box never active: the test is not exercising box-QP"
 
     assert abs(lateral_error(sol.X[-1], problem.ref[-1])) < 0.1
 

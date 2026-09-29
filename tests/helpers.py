@@ -65,8 +65,7 @@ def riccati(problem: LQRProblem, x0: np.ndarray):
 
 def arc_reference(N: int = 40, v: float = 8.0, yaw_rate: float = 0.2) -> np.ndarray:
     """(N+1, 4) reference produced by the bicycle itself, so it is exactly trackable."""
-    delta = math.atan(yaw_rate * bicycle.WHEEL_BASE / v)
-    x = np.array([0.0, 0.0, 0.0, v, 0.0, delta])
+    x = np.array([0.0, 0.0, 0.0, v, 0.0, yaw_rate / v])  # constant curvature
     states = [x]
     for _ in range(N):
         x = bicycle.step(x, np.zeros(2))
@@ -74,20 +73,22 @@ def arc_reference(N: int = 40, v: float = 8.0, yaw_rate: float = 0.2) -> np.ndar
     return np.array(states)[:, :4]
 
 
-def toy_case(lateral_offset: float = 1.0, steer_rate_max: float = 0.15):
-    """Ego starts beside the arc with zero steering; a tight steer-rate box forces clamped knots."""
+def toy_case(lateral_offset: float = 1.0, sigma_max: float = 0.006):
+    """Ego starts beside the arc with zero curvature; a tight sigma box forces clamped knots. (0.006 1/m^2 at 8 m/s
+    is the P2 toy's 0.15 rad/s steer-rate box.)"""
     ref = arc_reference()
-    problem = TrackingProblem(ref, u_lb=(-4.0, -steer_rate_max), u_ub=(4.0, steer_rate_max))
+    problem = TrackingProblem(ref, u_lb=(-4.0, -sigma_max), u_ub=(4.0, sigma_max))
     x0 = np.array([0.0, lateral_offset, 0.0, ref[0, 3], 0.0, 0.0])
     return problem, x0, np.zeros((problem.N, problem.m))
 
 
 def reg_path_case():
     """Zero control-effort weight makes Quu singular, so every backward pass needs regularization, and the
-    near bang-bang steps make line searches fail. Exercises the whole reg schedule, which the toy case never does."""
+    near bang-bang steps make line searches fail. Exercises the whole reg schedule, which the toy case never does.
+    Starts 2 m off the arc: with the curvature-rate model a 1 m offset only lifts reg to 0.3 (measured)."""
     ref = arc_reference()
-    problem = TrackingProblem(ref, w_jerk=0.0, w_steer_rate=0.0)
-    x0 = np.array([0.0, 1.0, 0.0, ref[0, 3], 0.0, 0.0])
+    problem = TrackingProblem(ref, w_jerk=0.0, w_sigma=0.0)
+    x0 = np.array([0.0, 2.0, 0.0, ref[0, 3], 0.0, 0.0])
     return problem, x0, np.zeros((problem.N, problem.m))
 
 

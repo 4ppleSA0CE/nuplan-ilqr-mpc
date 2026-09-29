@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from planner.costs import RouteProblem
+from planner.costs import KAPPA_MAX, SIGMA_MAX, SIGMA_WEIGHT, TRACK_OFFSET, RouteProblem
 from planner.ilqr import solve
 from planner.route import make_centerline, project
 
@@ -47,8 +47,9 @@ def _smooth_states(problem, rng, K):
 @pytest.mark.parametrize("westbound", [False, True])
 def test_jacobians_match_central_differences(westbound):
     cl = _s_curve(westbound=westbound)
-    # Tight limits so every hinge fires somewhere in the sample (defaults almost never trip lat, yaw, delta).
-    problem = RouteProblem(cl, (0, len(cl.s) - 1), N=100, a_min=-1.0, a_max=1.0, delta_max=0.3,
+    # Tight limits so every hinge fires somewhere in the sample (defaults almost never trip lat, yaw, kappa).
+    # s_target far ahead: the terminal progress row is active, so its Jacobian is compared too.
+    problem = RouteProblem(cl, (0, len(cl.s) - 1), N=100, s_target=200.0, a_min=-1.0, a_max=1.0, kappa_max=0.3,
                            a_lat_max=1.0, yaw_max=0.2)
     rng = np.random.default_rng(5)
     X, U = _smooth_states(problem, rng, 101), rng.uniform(-1.0, 1.0, (100, 2))
@@ -74,36 +75,47 @@ def test_jacobians_match_central_differences(westbound):
 
 def test_residuals_by_hand():
     cl = _straight()  # v_ref = 10 until the braking zone for the route end, which starts at 100 - 100/3 m
-    problem = RouteProblem(cl, (0, len(cl.s) - 1), N=1)
-    assert (problem.p, problem.pN) == (14, 12)
-    assert np.array_equal(problem.u_lb, [-4.0, -0.5]) and np.array_equal(problem.u_ub, [4.0, 0.5])
-    X = np.array([[5.0, 0.5, 0.1, 8.0, 3.0, 0.2], [10.0, -0.3, -0.05, 12.0, -5.0, -1.2]])
+    problem = RouteProblem(cl, (0, len(cl.s) - 1), N=1, track_offset=0.0)  # rear axle: hand values stay simple
+    assert (problem.p, problem.pN) == (14, 13)
+    assert np.array_equal(problem.u_lb, [-4.0, -SIGMA_MAX]) and np.array_equal(problem.u_ub, [4.0, SIGMA_MAX])
+    X = np.array([[5.0, 0.5, 0.1, 8.0, 3.0, 0.07], [10.0, -0.3, -0.05, 12.0, -5.0, -0.6]])
     U = np.array([[1.5, -0.2]])
     r, rN = problem.residuals(X, U)
-    L, h = 3.089, lambda z: max(z, 0.0)
+    h = lambda z: max(z, 0.0)  # noqa: E731
 
-    def limits(v, a, d):
-        yaw = v * math.tan(d) / L
+    def limits(v, a, k):
+        yaw = v * k
         lat = v * yaw
-        return [h(a - 2.40), h(-4.05 - a), h(d - math.pi / 3), h(-math.pi / 3 - d), h(-v),
+        return [h(a - 2.40), h(-4.05 - a), h(k - KAPPA_MAX), h(-KAPPA_MAX - k), h(-v),
                 h(lat - 4.0), h(-4.0 - lat), h(yaw - 0.8), h(-0.8 - yaw)]
 
     sl = math.sqrt(100.0)
     expect_r = ([1.0 * 0.5, 1.0 * 0.1, math.sqrt(0.5) * (8.0 - 10.0)]
-                + [math.sqrt(0.1) * 1.5, math.sqrt(0.1) * -0.2]
-                + [sl * z for z in limits(8.0, 3.0, 0.2)])
-    expect_rN = [1.0 * -0.3, 1.0 * -0.05, math.sqrt(0.5) * (12.0 - 10.0)] + [sl * z for z in limits(12.0, -5.0, -1.2)]
-    assert r.shape == (1, 14) and rN.shape == (12,)
+                + [math.sqrt(0.1) * 1.5, math.sqrt(SIGMA_WEIGHT) * -0.2]
+                + [sl * z for z in limits(8.0, 3.0, 0.07)])
+    expect_rN = ([1.0 * -0.3, 1.0 * -0.05, math.sqrt(0.5) * (12.0 - 10.0)] + [sl * z for z in limits(12.0, -5.0, -0.6)]
+                 + [0.0])  # no s_target: the progress row is zero
+    assert r.shape == (1, 14) and rN.shape == (13,)
     assert np.allclose(r[0], expect_r, rtol=1e-12, atol=1e-12)
     assert np.allclose(rN, expect_rN, rtol=1e-12, atol=1e-12)
-    # The hand case exercises: a_hi and lat_hi at knot 0; a_lo, delta_lo, lat_lo and yaw_lo at the terminal knot.
+    # The hand case exercises: a_hi and lat_hi at knot 0; a_lo, kappa_lo, lat_lo and yaw_lo at the terminal knot.
     assert np.count_nonzero(r[0, 5:]) == 2 and np.count_nonzero(rN[3:]) == 4
+    # Progress: the terminal knot is at x = 10 on the straight centerline, so s = 10; target 25 is 15 m short.
+    _, rN_p = RouteProblem(cl, (0, len(cl.s) - 1), N=1, s_target=25.0, track_offset=0.0).residuals(X, U)
+    assert rN_p[-1] == pytest.approx(math.sqrt(0.1) * (10.0 - 25.0), abs=1e-12)
+    assert np.allclose(rN_p[:-1], rN[:-1], atol=1e-12)
     # Heading wrap: a westbound centerline (heading pi) and a knot at -pi + 0.05, which is 0.05 rad left of it.
     west = make_centerline(np.column_stack([np.linspace(100.0, 0.0, 201), np.zeros(201)]), np.full(201, 10.0),
                            a_lat_ref=3.0, b_ref=1.5)
     Xw = np.array([[50.0, 0.0, -math.pi + 0.05, 10.0, 0.0, 0.0]] * 2)
-    rw, _ = RouteProblem(west, (0, len(west.s) - 1), N=1).residuals(Xw, U)
+    rw, _ = RouteProblem(west, (0, len(west.s) - 1), N=1, track_offset=0.0).residuals(Xw, U)
     assert rw[0, 1] == pytest.approx(0.05, abs=1e-12)
+    # Default tracked point: the geometric center, TRACK_OFFSET ahead along the heading. Knot 0 sits at y = 0.5 with
+    # heading 0.1, so the center is 0.5 + TRACK_OFFSET sin(0.1) left of the x-axis centerline, TRACK_OFFSET cos(0.1)
+    # further along it.
+    r_c, rN_c = RouteProblem(cl, (0, len(cl.s) - 1), N=1, s_target=25.0).residuals(X, U)
+    assert r_c[0, 0] == pytest.approx(0.5 + TRACK_OFFSET * math.sin(0.1), abs=1e-12)
+    assert rN_c[-1] == pytest.approx(math.sqrt(0.1) * (10.0 + TRACK_OFFSET * math.cos(-0.05) - 25.0), abs=1e-12)
 
 
 def test_solver_pulls_an_offset_start_onto_the_centerline():

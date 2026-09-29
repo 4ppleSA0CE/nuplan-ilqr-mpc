@@ -139,6 +139,15 @@ def test_route_starting_in_a_curve_is_slowed_from_the_first_sample():
     assert cl.v_ref[0] == pytest.approx(np.sqrt(A_LAT * radius), rel=0.05)
 
 
+def test_progress_target_follows_v_ref_with_bounded_acceleration():
+    x = np.arange(0.0, 400.01, 1.0)
+    cl = make_centerline(np.column_stack([x, 0 * x]), np.full(len(x), 10.0), a_lat_ref=A_LAT, b_ref=B_REF)
+    # From standstill at 1.5 m/s^2 for 4 s: 0.1 s steps, speed 0.15, 0.30, ... 6.0, so s = 0.1 * 0.15 * (1 + ... + 40).
+    assert route.progress_target(cl, 0.0, 0.0, 40, 0.1, 1.5) == pytest.approx(0.1 * 0.15 * 40 * 41 / 2)
+    assert route.progress_target(cl, 0.0, 10.0, 40, 0.1, 1.5) == pytest.approx(40.0)  # already at v_ref
+    assert 399.0 < route.progress_target(cl, 390.0, 10.0, 40, 0.1, 1.5) <= cl.s[-1]  # brakes to the end, never past it
+
+
 def _hairpin():
     """East along y = 0 for 30 m, left U-turn of radius 1.5, west along y = 3: two branches 3 m apart."""
     a = np.column_stack([np.linspace(0.0, 30.0, 61), np.zeros(61)])
