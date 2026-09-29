@@ -1,0 +1,12 @@
+ilqr_planner:
+  _target_: planner.ilqr_planner.ILQRPlanner
+  _convert_: 'all'
+  a_lat_ref: 3.0        # [m/s^2] lateral acceleration the speed reference allows in curves
+  b_ref: 1.5            # [m/s^2] braking the speed reference uses into curves and to the route end
+  v_default: 15.0       # [m/s] speed limit for lanes that have none
+  max_iters: 10         # warm-started ticks
+  max_iters_cold: 20    # the first tick, or any tick not 0.1 +- 0.02 s after the previous one
+  budget_s: null        # [s] wall-clock cap per warm solve; null = none (scored runs: iteration caps only)
+  budget_cold_s: null
+  log_dir: null         # null: use $ILQR_LOG_DIR, and no per-tick log if that is unset too
+  weights: {}           # RouteProblem keyword overrides (w_ey, a_max, ...); empty = the defaults in planner/costs.py
