@@ -6,6 +6,7 @@ from typing import Sequence, Tuple
 import numpy as np
 
 from planner import bicycle
+from planner.route import project
 
 
 def hinge(z: np.ndarray) -> np.ndarray:
@@ -90,6 +91,128 @@ class TrackingProblem:
     def residual_jacobians(self, X: np.ndarray, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """X (N+1, 6), U (N, 2) -> Jx (N, p, 6), Ju (N, p, 2), JxN (pN, 6)."""
         Js = self._state_jacobians(X)  # (N+1, pN, 6)
+        N, t = self.N, self.N_TRACK
+        Jx = np.zeros((N, self.p, self.n))
+        Jx[:, :t] = Js[:-1, :t]
+        Jx[:, t + self.N_EFFORT :] = Js[:-1, t:]
+        Ju = np.zeros((N, self.p, self.m))
+        Ju[:, t + 0, 0] = self.s_effort[0]
+        Ju[:, t + 1, 1] = self.s_effort[1]
+        return Jx, Ju, Js[-1]
+
+
+class RouteProblem:
+    """Follow a route centerline at its speed reference (P3 free driving).
+
+    Per-knot residuals (p = 14): tracking e_y, e_psi, e_v | effort jerk, steer_rate |
+    limits a_hi, a_lo, delta_hi, delta_lo, v_neg, lat_hi, lat_lo, yaw_hi, yaw_lo. Terminal (pN = 12): tracking + limits.
+    Knots project onto a fixed window of centerline segments, so residuals are a pure function of (X, U).
+    """
+
+    n, m = bicycle.NX, bicycle.NU
+    N_TRACK, N_EFFORT, N_LIMIT = 3, 2, 9  # row counts; rows are laid out in this order
+    p, pN = N_TRACK + N_EFFORT + N_LIMIT, N_TRACK + N_LIMIT
+
+    def __init__(
+        self,
+        centerline,  # route.Centerline
+        seg_window: Tuple[int, int],
+        N: int = 40,
+        *,
+        w_ey: float = 1.0,
+        w_psi: float = 1.0,
+        w_v: float = 0.5,
+        w_jerk: float = 0.1,
+        w_steer_rate: float = 0.1,
+        w_limit: float = 100.0,
+        a_min: float = -4.05,
+        a_max: float = 2.40,
+        delta_max: float = np.pi / 3,
+        a_lat_max: float = 4.0,
+        yaw_max: float = 0.8,
+        u_lb: Sequence[float] = (-4.0, -0.5),
+        u_ub: Sequence[float] = (4.0, 0.5),
+    ) -> None:
+        self.cl, (self.lo, self.hi), self.N = centerline, seg_window, N
+        self.s_track = np.sqrt(np.array([w_ey, w_psi, w_v]))
+        self.s_effort = np.sqrt(np.array([w_jerk, w_steer_rate]))
+        self.s_limit = float(np.sqrt(w_limit))
+        self.a_min, self.a_max, self.delta_max = a_min, a_max, delta_max
+        self.a_lat_max, self.yaw_max = a_lat_max, yaw_max
+        self.u_lb = np.array(u_lb, dtype=np.float64)
+        self.u_ub = np.array(u_ub, dtype=np.float64)
+
+    step = staticmethod(bicycle.step)
+    linearize = staticmethod(bicycle.linearize)
+
+    def _tracking(self, X: np.ndarray):
+        """(K, 6) -> e (K, 3) = (e_y, e_psi, e_v) and its Jacobian w.r.t. (x, y), (K, 3, 2)."""
+        cl = self.cl
+        seg, f = project(cl, self.lo, self.hi, X[:, :2], X[:, 2])
+        t, h = cl.seg_t[seg], cl.seg_len[seg]
+        n = np.column_stack([-t[:, 1], t[:, 0]])
+        e_y = np.einsum("ki,ki->k", X[:, :2] - cl.xy[seg], n)
+        dpsi, dv = cl.psi[seg + 1] - cl.psi[seg], cl.v_ref[seg + 1] - cl.v_ref[seg]
+        e_psi = wrap_angle(X[:, 2] - (cl.psi[seg] + f * dpsi))
+        e_v = X[:, 3] - (cl.v_ref[seg] + f * dv)
+        inside = ((f > 0.0) & (f < 1.0)).astype(np.float64)  # a clipped fraction does not move with p
+        df_dp = (inside / h)[:, None] * t
+        J = np.stack([n, -dpsi[:, None] * df_dp, -dv[:, None] * df_dp], axis=1)
+        return np.column_stack([e_y, e_psi, e_v]), J
+
+    def _limit_args(self, X: np.ndarray) -> np.ndarray:
+        """(K, 6) -> (K, 9) hinge arguments z; the limit is violated where z > 0."""
+        v, a, delta = X[:, 3], X[:, 4], X[:, 5]
+        yaw = v * np.tan(delta) / bicycle.WHEEL_BASE
+        lat = v * yaw
+        return np.stack(
+            [
+                a - self.a_max, self.a_min - a, delta - self.delta_max, -self.delta_max - delta, -v,
+                lat - self.a_lat_max, -self.a_lat_max - lat, yaw - self.yaw_max, -self.yaw_max - yaw,
+            ],
+            axis=1,
+        )
+
+    def _state_residuals(self, X: np.ndarray) -> np.ndarray:
+        """(K, 6) -> (K, pN): tracking then limits."""
+        e, _ = self._tracking(X)
+        return np.concatenate([self.s_track * e, self.s_limit * hinge(self._limit_args(X))], axis=1)
+
+    def _state_jacobians(self, X: np.ndarray) -> np.ndarray:
+        """(K, 6) -> (K, pN, 6). Rows mirror _state_residuals and _limit_args."""
+        K = X.shape[0]
+        _, Jxy = self._tracking(X)
+        J = np.zeros((K, self.pN, self.n))
+        J[:, :3, :2] = self.s_track[None, :, None] * Jxy
+        J[:, 1, 2] = self.s_track[1]  # e_psi = psi - psi_c
+        J[:, 2, 3] = self.s_track[2]  # e_v = v - v_ref
+        v, delta = X[:, 3], X[:, 5]
+        L, tan, sec2 = bicycle.WHEEL_BASE, np.tan(delta), 1.0 / np.cos(delta) ** 2
+        dyaw = np.stack([tan / L, v * sec2 / L], axis=1)  # d yaw / d (v, delta)
+        dlat = np.stack([2 * v * tan / L, v**2 * sec2 / L], axis=1)
+        act = self.s_limit * (self._limit_args(X) > 0.0)
+        t = self.N_TRACK
+        J[:, t + 0, 4] = act[:, 0]
+        J[:, t + 1, 4] = -act[:, 1]
+        J[:, t + 2, 5] = act[:, 2]
+        J[:, t + 3, 5] = -act[:, 3]
+        J[:, t + 4, 3] = -act[:, 4]
+        J[:, t + 5][:, [3, 5]] = act[:, 5:6] * dlat
+        J[:, t + 6][:, [3, 5]] = -act[:, 6:7] * dlat
+        J[:, t + 7][:, [3, 5]] = act[:, 7:8] * dyaw
+        J[:, t + 8][:, [3, 5]] = -act[:, 8:9] * dyaw
+        return J
+
+    def residuals(self, X: np.ndarray, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """X (N+1, 6), U (N, 2) -> r (N, p), rN (pN,)."""
+        s = self._state_residuals(X)
+        t = self.N_TRACK
+        r = np.concatenate([s[:-1, :t], self.s_effort * U, s[:-1, t:]], axis=1)
+        return r, s[-1]
+
+    def residual_jacobians(self, X: np.ndarray, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """X (N+1, 6), U (N, 2) -> Jx (N, p, 6), Ju (N, p, 2), JxN (pN, 6)."""
+        Js = self._state_jacobians(X)
         N, t = self.N, self.N_TRACK
         Jx = np.zeros((N, self.p, self.n))
         Jx[:, :t] = Js[:-1, :t]
