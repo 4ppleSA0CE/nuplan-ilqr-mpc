@@ -15,8 +15,8 @@ from typing import Tuple
 import numpy as np
 import pandas as pd
 
-MULTIPLIERS = ("no_ego_at_fault_collisions", "drivable_area_compliance", "driving_direction_compliance",
-               "ego_is_making_progress")
+MULTIPLIERS = {"no_ego_at_fault_collisions": "no-collision", "drivable_area_compliance": "drivable",
+               "driving_direction_compliance": "direction", "ego_is_making_progress": "progress"}
 
 
 def paired_bootstrap(ref: np.ndarray, other: np.ndarray, n: int = 10000, seed: int = 0) -> Tuple[float, float, float]:
@@ -50,7 +50,7 @@ def main(experiments) -> None:
     n = len(ref)
     for name, r in zip(experiments, runs):
         r = r.loc[ref.index]
-        passes = "  ".join(f"{m.split('_')[-1]} {int((r[m] == 1).sum())}/{n}" for m in MULTIPLIERS)
+        passes = "  ".join(f"{label} {int((r[m] == 1).sum())}/{n}" for m, label in MULTIPLIERS.items())
         line = f"{name}: CLS {100 * r.score.mean():.2f}  {passes}  comfortable {int((r.ego_is_comfortable == 1).sum())}/{n}"
         if r is not ref:
             d, lo, hi = paired_bootstrap(ref.score.values, r.score.values)
