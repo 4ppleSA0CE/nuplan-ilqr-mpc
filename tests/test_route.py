@@ -146,6 +146,11 @@ def test_progress_target_follows_v_ref_with_bounded_acceleration():
     assert route.progress_target(cl, 0.0, 0.0, 40, 0.1, 1.5) == pytest.approx(0.1 * 0.15 * 40 * 41 / 2)
     assert route.progress_target(cl, 0.0, 10.0, 40, 0.1, 1.5) == pytest.approx(40.0)  # already at v_ref
     assert 399.0 < route.progress_target(cl, 390.0, 10.0, 40, 0.1, 1.5) <= cl.s[-1]  # brakes to the end, never past it
+    # Still rolling backward at the horizon's end (-6 m/s + 4 s at 1.5 m/s^2): the target waits, never goes backward.
+    assert route.progress_target(cl, 50.0, -6.0, 40, 0.1, 1.5) == 50.0
+    # Braking this hard, v_ref falls from 10 m/s to 0 over the last sample gap: 0.4 m out, a step goes 0.8 m.
+    steep = make_centerline(np.column_stack([x, 0 * x]), np.full(len(x), 10.0), a_lat_ref=A_LAT, b_ref=100.0)
+    assert route.progress_target(steep, 399.6, 10.0, 40, 0.1, 1.5) == steep.s[-1]
 
 
 def _hairpin():

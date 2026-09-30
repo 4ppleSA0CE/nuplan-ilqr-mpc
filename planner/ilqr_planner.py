@@ -22,9 +22,11 @@ from planner.route import build_centerline, progress_target, project
 
 N = 40  # knots: a 4 s plan at bicycle.DT
 TICK_US = int(bicycle.DT * 1e6)
+STANDSTILL_V = 0.3  # [m/s] below this a carried deceleration is dropped (see compute_planner_trajectory)
 PROGRESS_ACCEL = 1.5  # [m/s^2] how fast the progress target lets the car gain speed toward v_ref
 LOG_FIELDS = ["tick", "cold", "status", "iters", "solve_ms", "cost", "x", "y", "psi", "v", "a", "kappa", "s", "v_ref",
-              "e_y", "e_psi", "center_offset", "err_lon", "err_lat", "err_psi", "err_v"]
+              "e_y", "e_psi", "center_offset", "err_lon", "err_lat", "err_psi", "err_v",
+              "a_plant", "kappa_plant"]
 
 
 class ILQRPlanner(AbstractPlanner):
@@ -66,6 +68,7 @@ class ILQRPlanner(AbstractPlanner):
         self._U: Optional[np.ndarray] = None
         self._X: Optional[np.ndarray] = None
         self._t_us: Optional[int] = None
+        self._status: Optional[str] = None
         self._log_path: Optional[str] = None
         self._tick = 0
 
@@ -89,22 +92,28 @@ class ILQRPlanner(AbstractPlanner):
                                **self._weights)
 
         # Log timestamps jitter around 0.1 s, so a step within 20 ms of it counts as the next tick.
-        warm = self._U is not None and abs(ego.time_us - self._t_us - TICK_US) <= TICK_US // 5
+        # A non-finite plan is no start point, so the tick after one solves cold.
+        warm = (self._U is not None and self._status != "non_finite"
+                and abs(ego.time_us - self._t_us - TICK_US) <= TICK_US // 5)
         err = self._tracking_error(x0) if warm else [math.nan] * 4
+        plant = list(x0[4:])
         if warm:
             # The tracker realizes poses only; the plant's own acceleration and steering lag and differ from the plan's.
             # At 13 m/s a 0.004 1/m curvature mismatch bends a 4 s rollout by 5 m, so carry the plan's a and kappa.
             x0[4:] = self._X[1, 4:]
+            if x0[3] < STANDSTILL_V:
+                # Except braking at standstill: v >= 0 is only a soft limit, so a carried a < 0 plans the car backward.
+                x0[4] = max(x0[4], 0.0)
         U_init = np.vstack([self._U[1:], self._U[-1:]]) if warm else np.zeros((N, bicycle.NU))
         sol = solve(problem, x0, U_init,
                     max_iters=self._max_iters if warm else self._max_iters_cold,
                     budget_s=self._budget_s if warm else self._budget_cold_s)
-        self._U, self._X, self._t_us = sol.U, sol.X, ego.time_us
+        self._U, self._X, self._t_us, self._status = sol.U, sol.X, ego.time_us, sol.status
 
         r, _ = problem.residuals(sol.X, sol.U)
         e = r[0, :3] / problem.s_track  # knot 0: e_y, e_psi, e_v
         self._write_log(ego, [self._tick, int(not warm), sol.status, sol.iters, 1e3 * sol.solve_time_s, sol.cost,
-                              *x0, self._s, x0[3] - e[2], e[0], e[1], self._center_offset(cl, ego), *err])
+                              *x0, self._s, x0[3] - e[2], e[0], e[1], self._center_offset(cl, ego), *err, *plant])
         self._tick += 1
 
         params = ego.car_footprint.vehicle_parameters

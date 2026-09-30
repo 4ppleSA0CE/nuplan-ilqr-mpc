@@ -13,6 +13,7 @@ experiment="ilqr_${split}_${agents}_$(git rev-parse --short HEAD 2>/dev/null || 
 export ILQR_LOG_DIR="$NUPLAN_EXP_ROOT/ilqr_logs/$experiment"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"  # threads are pure overhead on 6x6 matrices
 
+# exit_on_failure: the devkit default (false) silently drops a scenario whose planner raised from the aggregate.
 "${PYTHON:-python}" "${DEVKIT:-external/nuplan-devkit}/nuplan/planning/script/run_simulation.py" \
   "+simulation=closed_loop_${agents}_agents" \
   planner=ilqr_planner \
@@ -21,5 +22,6 @@ export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"  # threads are pure ove
   "hydra.searchpath=[pkg://nuplan.planning.script.config.common,pkg://nuplan.planning.script.experiments,file://$PWD/config]" \
   "experiment_name=${experiment}" \
   worker=sequential \
+  exit_on_failure=true \
   "$@"
 echo "planner logs: $ILQR_LOG_DIR"

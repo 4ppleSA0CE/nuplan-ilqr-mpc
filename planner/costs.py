@@ -112,7 +112,8 @@ class RouteProblem:
 
     Per-knot residuals (p = 14): tracking e_y, e_psi, e_v | effort jerk, sigma |
     limits a_hi, a_lo, kappa_hi, kappa_lo, v_neg, lat_hi, lat_lo, yaw_hi, yaw_lo.
-    Terminal (pN = 13): tracking + limits + progress, sqrt(w) * (s(x_N) - s_target), zero when s_target is None.
+    Terminal (pN = 13): tracking + limits + progress, sqrt(w) * (s(x_N) - s_target), zero when s_target is None;
+    s(x_N) extrapolates along the projected segment (see _progress); the tracking rows use the clipped fraction.
     The progress row exists because tracking cost is summed over time: without it, a car stopped at a bad angle
     finds "wait, then go" cheaper than going now, replans the same every tick, and never moves (P3, tight turns).
     Tracking and progress are measured at a point track_offset ahead of the rear axle (default: the vehicle's
@@ -227,18 +228,22 @@ class RouteProblem:
         return J
 
     def _progress(self, x: np.ndarray) -> Tuple[float, np.ndarray]:
-        """Terminal state (6,) -> progress residual and its Jacobian (6,)."""
+        """Terminal state (6,) -> progress residual and its Jacobian (6,).
+
+        Arc length uses the projected segment's fraction unclipped: extrapolated past either end, it keeps a gradient
+        along the segment. Clipped, the gradient would vanish past the window end, and on the outside of a curve,
+        where a point can lie past the end of one segment and before the start of the next."""
         if self.s_target is None:
             return 0.0, np.zeros(self.n)
+        cl = self.cl
         P, dP_dpsi = self._point(x[None])
-        seg, f = project(self.cl, self.lo, self.hi, P, x[2:3])
-        i, f = int(seg[0]), float(f[0])
-        ds = self.cl.s[i + 1] - self.cl.s[i]
+        i = int(project(cl, self.lo, self.hi, P, x[2:3])[0][0])
+        ds, t = cl.s[i + 1] - cl.s[i], cl.seg_t[i]
+        f = float((P[0] - cl.xy[i]) @ t) / cl.seg_len[i]
         J = np.zeros(self.n)
-        if 0.0 < f < 1.0:  # a clipped fraction does not move with position
-            J[:2] = self.s_progress * ds / self.cl.seg_len[i] * self.cl.seg_t[i]
-            J[2] = J[:2] @ dP_dpsi[0]
-        return self.s_progress * (self.cl.s[i] + f * ds - self.s_target), J
+        J[:2] = self.s_progress * ds / cl.seg_len[i] * t
+        J[2] = J[:2] @ dP_dpsi[0]
+        return self.s_progress * (cl.s[i] + f * ds - self.s_target), J
 
     def residuals(self, X: np.ndarray, U: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """X (N+1, 6), U (N, 2) -> r (N, p), rN (pN,)."""

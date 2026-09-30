@@ -163,3 +163,42 @@ def _check_xy_jacobians(problem, X):
             rm, rNm = problem.residuals(Xm, U)
             fd = (rp[0] - rm[0]) / (2 * EPS) if k == 0 else (rNp - rNm) / (2 * EPS)
             assert np.allclose(J[:, i], fd, atol=1e-7), f"knot {k}, coordinate {i}"
+
+
+def test_progress_gradient_past_the_window_end_and_outside_a_curve():
+    """The progress row extrapolates along its segment instead of clipping, so its gradient never vanishes: not past
+    the window end, and not outside a curve, where a point can lie past the end of one segment and before the start
+    of the next."""
+    cl = _straight()
+    problem = RouteProblem(cl, (0, len(cl.s) - 1), N=1, s_target=120.0)
+    X = np.array([[103.0, 0.7, 0.05, 3.0, 0.0, 0.0], [104.0, -0.4, -0.02, 2.0, 0.0, 0.0]])  # 3-4 m past the end
+    _, _, JxN = problem.residual_jacobians(X, np.zeros((1, 2)))
+    # The tracked point is TRACK_OFFSET ahead of the rear axle: s = 104 + TRACK_OFFSET cos(psi), on a straight line.
+    assert JxN[-1, :3] == pytest.approx(math.sqrt(0.1) * np.array([1.0, 0.0, -TRACK_OFFSET * math.sin(-0.02)]))
+    progress = lambda X_: problem.residuals(X_, np.zeros((1, 2)))[1][-1]  # noqa: E731
+    for i in range(3):
+        Xp, Xm = X.copy(), X.copy()
+        Xp[1, i] += EPS
+        Xm[1, i] -= EPS
+        fd = (progress(Xp) - progress(Xm)) / (2 * EPS)
+        assert JxN[-1, i] == pytest.approx(fd, abs=1e-7), f"state {i}"
+    th = np.linspace(0.0, np.pi / 2, 400)
+    arc = make_centerline(np.column_stack([10 * np.sin(th), 10 - 10 * np.cos(th)]), np.full(400, 10.0),
+                          a_lat_ref=3.0, b_ref=1.5)  # left turn, radius 10 m
+    p = RouteProblem(arc, (0, len(arc.s) - 1), N=1, s_target=100.0, track_offset=0.0)
+    a = np.linspace(0.3, 1.2, 2000)
+    Xo = np.column_stack([11 * np.sin(a), 10 - 11 * np.cos(a), a, np.full_like(a, 5.0), 0 * a, 0 * a])  # 1 m outside
+    assert all(np.any(p._progress(x)[1] != 0.0) for x in Xo)
+
+
+def test_progress_is_arc_length_where_a_chord_cuts_a_corner():
+    """Arc length runs along the input polyline, so a segment across its corner is shorter than its ds. Progress
+    interpolates s over the segment, so it meets cl.s at both ends, as the planner's own s does."""
+    cl = make_centerline(np.array([[0.0, 0.0], [10.25, 0.0], [15.25, 5.0]]), np.full(3, 10.0), a_lat_ref=3.0,
+                         b_ref=1.5)  # a 45 degree corner a quarter of a sample past s = 10
+    i = int(np.argmax(cl.s[1:] - cl.s[:-1] - cl.seg_len))
+    assert cl.s[i] == 10.0 and cl.s[i + 1] - cl.s[i] - cl.seg_len[i] > 0.03
+    problem = RouteProblem(cl, (0, len(cl.s) - 1), N=1, s_target=0.0, track_offset=0.0, w_progress=1.0)
+    t = cl.seg_t[i]
+    x = np.array([*(cl.xy[i] + 0.999 * cl.seg_len[i] * t), np.arctan2(t[1], t[0]), 5.0, 0.0, 0.0])
+    assert problem._progress(x)[0] == pytest.approx(cl.s[i] + 0.999 * (cl.s[i + 1] - cl.s[i]), abs=1e-9)

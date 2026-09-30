@@ -154,7 +154,9 @@ def build_centerline(map_api, route_roadblock_ids, ego_state, *, a_lat_ref: floa
     """nuPlan route -> (Centerline, info). nuPlan route lists are noisy: some start several roadblocks behind the ego,
     some have gaps, and a few never come near the ego at all. So:
 
-    1. Start on the lane (or lane connector) under the ego center whose heading is closest to the ego's.
+    1. Start on a lane (or lane connector) under the ego center within 90 degrees of the ego's heading: an on-route
+       one if any, the closest in heading among those. With none, the nearest one within 10 m, preferring those
+       within 90 degrees.
     2. If that lane's roadblock is on the route, drop the roadblocks before it. Otherwise search JOIN_DEPTH lanes
        ahead for one that is, and prepend the lanes that lead there.
     3. Breadth-first search through the remaining route's lanes to its last roadblock, as IDMPlanner does. If it
@@ -172,9 +174,13 @@ def build_centerline(map_api, route_roadblock_ids, ego_state, *, a_lat_ref: floa
     def heading_gap(lane) -> float:
         return abs(math.remainder(lane.baseline_path.get_nearest_pose_from_position(point).heading - heading, 2 * math.pi))
 
-    under = [o for layer in layers for o in map_api.get_all_map_objects(point, layer)]
+    ids = list(route_roadblock_ids)
+    # Oncoming lanes are out: an ego center just over the lane divider sits in the oncoming lane's polygon. At an
+    # intersection entry the connectors under the ego share their start pose, so the route decides between them.
+    under = [o for layer in layers for o in map_api.get_all_map_objects(point, layer) if heading_gap(o) <= math.pi / 2]
     if under:
-        start = min(under, key=heading_gap)
+        on = [o for o in under if o.get_roadblock_id() in ids]
+        start = min(on or under, key=heading_gap)
     else:
         near = [o for objs in map_api.get_proximal_map_objects(point, 10.0, list(layers)).values() for o in objs]
         if not near:
@@ -182,7 +188,6 @@ def build_centerline(map_api, route_roadblock_ids, ego_state, *, a_lat_ref: floa
         foot = ego_state.car_footprint.geometry
         start = min(near, key=lambda o: (heading_gap(o) > math.pi / 2, o.polygon.distance(foot)))
 
-    ids = list(route_roadblock_ids)
     prefix = _path_to_route(start, set(ids)) if start.get_roadblock_id() not in ids else [start]
     lanes, complete = [start], False
     if prefix:
