@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Closed-loop run of a planner on a committed scenario split. Runs inside the container:
 #   docker/run.sh scripts/sim.sh <tuning|heldout> <nonreactive|reactive> [extra Hydra overrides...]
-#   PLANNER=idm_planner|pdm_closed_planner docker/run.sh scripts/sim.sh ...   baselines (default: ilqr_planner)
+#   docker/run.sh env PLANNER=idm_planner|pdm_closed_planner scripts/sim.sh ...   baselines (default: ilqr_planner)
+#   (set inside the container: docker/run.sh does not forward the host environment)
 # Per-tick planner logs (iLQR only) go to $NUPLAN_EXP_ROOT/ilqr_logs/<experiment>/, simulator output to the usual
 # experiment dir. The experiment name starts with ilqr, idm or pdm, then the split: eval/compare.py relies on that.
 set -euo pipefail
