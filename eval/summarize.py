@@ -10,9 +10,12 @@ import glob
 import json
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from nuplan.planning.simulation.simulation_log import SimulationLog
 
 from eval.scenarios import listed, load
 
@@ -72,6 +75,14 @@ def main(experiment: str) -> None:
     print(f"vehicle center to centerline |.|: p99 {ticks.center_offset.abs().quantile(0.99):.2f} m, "
           f"max {ticks.center_offset.abs().max():.2f} m")
     print(f"ticks with a solve ending in 'budget': {int((ticks.status == 'budget').sum())} (0 means the run is deterministic)")
+
+    # PRD R6's metric: the devkit's own per-tick compute_trajectory times, kept on the planner in each simulation log
+    # (the runner report only stores per-scenario mean, median and std, not p99).
+    runtimes = np.concatenate([
+        SimulationLog.load_data(Path(f)).planner._compute_trajectory_runtimes
+        for f in glob.glob(f"{EXP}/exp/{experiment}/*/*/simulation_log/*/*/*/*/*.msgpack.xz")])
+    print(f"\ncompute_trajectory (devkit, all {len(runtimes)} ticks): median {1e3 * np.median(runtimes):.1f} ms, "
+          f"p99 {1e3 * np.percentile(runtimes, 99):.1f} ms, max {1e3 * runtimes.max():.1f} ms")
 
 
 if __name__ == "__main__":
