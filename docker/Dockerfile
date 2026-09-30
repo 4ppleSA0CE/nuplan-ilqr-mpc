@@ -19,6 +19,13 @@ RUN git clone https://github.com/motional/nuplan-devkit.git /opt/nuplan-devkit \
     && git -C /opt/nuplan-devkit checkout ${DEVKIT_COMMIT} \
     && uv pip install --system --no-deps -e /opt/nuplan-devkit
 
+# tuPlan garage for the PDM-Closed baseline (P4). Only its planner is used: the training-only requirements
+# (scikit-learn, positional-encodings) are not needed, so --no-deps leaves the lock unchanged.
+ARG GARAGE_COMMIT=b51d5d0
+RUN git clone https://github.com/autonomousvision/tuplan_garage.git /opt/tuplan_garage \
+    && git -C /opt/tuplan_garage checkout ${GARAGE_COMMIT} \
+    && uv pip install --system --no-deps -e /opt/tuplan_garage
+
 # The repo is bind-mounted at /work; data read-only at /data/nuplan; outputs at /data/exp.
 ENV NUPLAN_DATA_ROOT=/data/nuplan \
     NUPLAN_MAPS_ROOT=/data/nuplan/maps \
